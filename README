@@ -1,0 +1,29 @@
+scripts:
+contains the sources for the NetCon framework and OpenFlow module
+implementation of Bro (called by its old name Pacf here)
+
+tests:
+contains Bro tests for the NetCon framework and the OpenFlow module.
+
+bro-netcon.patch:
+patches for the bro source (based on 2.4-beta), that are necessary to run the
+NetCon framework
+
+measure-http-connection-sizes.patch:
+contains the patch to Bro used to measure how much data is transfered after a
+specified amount of time, from tracefiles.
+
+controller.py:
+Ryu based controller that can communicate with an OpenFlow switch and the Bro
+network control framework
+
+command-line.py:
+Script interfacing to the command line backend of the network control
+framework, executing specified commands
+
+commands.yaml:
+command definition for the command line backend
+
+acld.py:
+Script interfacint to the acld backend of the network control framework that
+sends commands on to an acld instance

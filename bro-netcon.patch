@@ -1,0 +1,340 @@
+diff --git a/scripts/base/init-bare.bro b/scripts/base/init-bare.bro
+index 23f4fd4..2a8a2f7 100644
+--- a/scripts/base/init-bare.bro
++++ b/scripts/base/init-bare.bro
+@@ -120,6 +120,18 @@ type conn_id: record {
+ 	resp_p: port;	##< The responder's port number.
+ } &log;
+ 
++## The identifying 4-tuple of a uni-directional flow.
++##
++## .. note:: It's actually a 5-tuple: the transport-layer protocol is stored as
++##    part of the port values, `src_p` and `dst_p`, and can be extracted from
++##    them with :bro:id:`get_port_transport_proto`.
++type flow_id : record {
++	src_h: addr;	##< The source IP address.
++	src_p: port;	##< The source port number.
++	dst_h: addr;	##< The destination IP address.
++	dst_p: port;	##< The desintation port number.
++};
++
+ ## Specifics about an ICMP conversation. ICMP events typically pass this in
+ ## addition to :bro:type:`conn_id`.
+ ##
+diff --git a/scripts/base/init-default.bro b/scripts/base/init-default.bro
+index 473d94f..0fee22a 100644
+--- a/scripts/base/init-default.bro
++++ b/scripts/base/init-default.bro
+@@ -37,6 +37,8 @@
+ @load base/frameworks/reporter
+ @load base/frameworks/sumstats
+ @load base/frameworks/tunnels
++@load base/frameworks/openflow
++@load base/frameworks/pacf
+ 
+ @load base/protocols/conn
+ @load base/protocols/dhcp
+diff --git a/scripts/base/utils/json.bro b/scripts/base/utils/json.bro
+new file mode 100644
+index 0000000..b6d0093
+--- /dev/null
++++ b/scripts/base/utils/json.bro
+@@ -0,0 +1,105 @@
++##! Functions to assist with generating JSON data from Bro data scructures.
++# We might want to implement this in core somtime, this looks... hacky at best.
++
++@load base/utils/strings
++
++## A function to convert arbitrary Bro data into a JSON string.
++##
++## v: The value to convert to JSON.  Typically a record.
++##
++## only_loggable: If the v value is a record this will only cause
++##                fields with the &log attribute to be included in the JSON.
++##
++## returns: a JSON formatted string.
++function to_json(v: any, only_loggable: bool &default=F, field_escape_pattern: pattern &default=/^_/): string
++	{
++	local tn = type_name(v);
++	switch ( tn )
++		{
++		case "type":
++		return "";
++
++		case "string":
++		return cat("\"", gsub(gsub(clean(v), /\\/, "\\\\"), /\"/, "\\\""), "\"");
++
++		case "port":
++		return cat(port_to_count(to_port(cat(v))));
++
++		case "addr":
++		fallthrough;
++		case "subnet":
++		return cat("\"", v, "\"");
++
++		case "int":
++		fallthrough;
++		case "count":
++		fallthrough;
++		case "time":
++		fallthrough;
++		case "double":
++		fallthrough;
++		case "bool":
++		fallthrough;
++		case "enum":
++		return cat(v);
++
++		default:
++		break;
++		}
++
++	if ( /^record/ in tn )
++		{
++		local rec_parts: string_vec = vector();
++
++		local ft = record_fields(v);
++		for ( field in ft )
++			{
++			local field_desc = ft[field];
++			# replace the escape pattern in the field.
++			if( field_escape_pattern in field )
++				field = cat(sub(field, field_escape_pattern, ""));
++			if ( field_desc?$value && (!only_loggable || field_desc$log) )
++				{
++				local onepart = cat("\"", field, "\": ", to_json(field_desc$value, only_loggable));
++				rec_parts[|rec_parts|] = onepart;
++				}
++			}
++			return cat("{", join_string_vec(rec_parts, ", "), "}");
++		}
++
++	# None of the following are supported.
++	else if ( /^set/ in tn )
++		{
++		local set_parts: string_vec = vector();
++		local sa: set[bool] = v;
++		for ( sv in sa )
++			{
++			set_parts[|set_parts|] = to_json(sv, only_loggable);
++			}
++		return cat("[", join_string_vec(set_parts, ", "), "]");
++		}
++	else if ( /^table/ in tn )
++		{
++		local tab_parts: vector of string = vector();
++		local ta: table[bool] of any = v;
++		for ( ti in ta )
++			{
++			local ts = to_json(ti);
++			local if_quotes = (ts[0] == "\"") ? "" : "\"";
++			tab_parts[|tab_parts|] = cat(if_quotes, ts, if_quotes, ": ", to_json(ta[ti], only_loggable));
++			}
++		return cat("{", join_string_vec(tab_parts, ", "), "}");
++		}
++	else if ( /^vector/ in tn )
++		{
++		local vec_parts: string_vec = vector();
++		local va: vector of any = v;
++		for ( vi in va )
++			{
++			vec_parts[|vec_parts|] = to_json(va[vi], only_loggable);
++			}
++		return cat("[", join_string_vec(vec_parts, ", "), "]");
++		}
++
++	return "\"\"";
++	}
+diff --git a/src/Attr.cc b/src/Attr.cc
+index dad51c6..c3d9a23 100644
+--- a/src/Attr.cc
++++ b/src/Attr.cc
+@@ -18,7 +18,7 @@ const char* attr_name(attr_tag t)
+ 		"&encrypt",
+ 		"&raw_output", "&mergeable", "&priority",
+ 		"&group", "&log", "&error_handler", "&type_column",
+-		"(&tracked)", "&deprecated",
++		"(&tracked)", "&deprecated", "&weaken",
+ 	};
+ 
+ 	return attr_names[int(t)];
+@@ -453,6 +453,11 @@ void Attributes::CheckAttr(Attr* a)
+ 			Error("&log applied to a type that cannot be logged");
+ 		break;
+ 
++	case ATTR_WEAKEN:
++		if ( ! in_record )
++			Error("&weaken applied outside of record");
++		break;
++
+ 	case ATTR_TYPE_COLUMN:
+ 		{
+ 		if ( type->Tag() != TYPE_PORT )
+diff --git a/src/Attr.h b/src/Attr.h
+index 63f2524..f89fb9f 100644
+--- a/src/Attr.h
++++ b/src/Attr.h
+@@ -35,7 +35,8 @@ typedef enum {
+ 	ATTR_TYPE_COLUMN,	// for input framework
+ 	ATTR_TRACKED,	// hidden attribute, tracked by NotifierRegistry
+ 	ATTR_DEPRECATED,
+-#define NUM_ATTRS (int(ATTR_DEPRECATED) + 1)
++	ATTR_WEAKEN,
++#define NUM_ATTRS (int(ATTR_WEAKEN) + 1)
+ } attr_tag;
+ 
+ class Attr : public BroObj {
+diff --git a/src/Type.cc b/src/Type.cc
+index 7fab056..8aa32f6 100644
+--- a/src/Type.cc
++++ b/src/Type.cc
+@@ -1129,7 +1129,10 @@ void RecordType::DescribeFields(ODesc* d) const
+ 			const TypeDecl* td = FieldDecl(i);
+ 			d->Add(td->id);
+ 			d->Add(":");
+-			td->type->Describe(d);
++			if ( td->FindAttr(ATTR_WEAKEN) )
++				d->Add("<weakened>");
++			else
++				td->type->Describe(d);
+ 			d->Add(";");
+ 			}
+ 		}
+@@ -1170,7 +1173,10 @@ void RecordType::DescribeFieldsReST(ODesc* d, bool func_args) const
+ 			}
+ 
+ 		const TypeDecl* td = FieldDecl(i);
+-		td->DescribeReST(d);
++		if ( td->FindAttr(ATTR_WEAKEN) )
++			d->Add("<weakened>");
++		else
++			td->DescribeReST(d);
+ 
+ 		if ( func_args )
+ 			continue;
+diff --git a/src/bro.bif b/src/bro.bif
+index 037b236..6571826 100644
+--- a/src/bro.bif
++++ b/src/bro.bif
+@@ -2077,6 +2077,33 @@ function is_v6_addr%(a: addr%): bool
+ 		return new Val(0, TYPE_BOOL);
+ 	%}
+ 
++## Returns whether a subnet specification is IPv4 or not.
++##
++## s: the subnet to check.
++##
++## Returns: true if *a* is an IPv4 subnet, else false.
++function is_v4_subnet%(s: subnet%): bool
++	%{
++	if ( s->AsSubNet().Prefix().GetFamily() == IPv4 )
++		return new Val(1, TYPE_BOOL);
++	else
++		return new Val(0, TYPE_BOOL);
++	%}
++
++## Returns whether a subnet specification is IPv6 or not.
++##
++## s: the subnet to check.
++##
++## Returns: true if *a* is an IPv6 subnet, else false.
++function is_v6_subnet%(s: subnet%): bool
++	%{
++	if ( s->AsSubNet().Prefix().GetFamily() == IPv6 )
++		return new Val(1, TYPE_BOOL);
++	else
++		return new Val(0, TYPE_BOOL);
++	%}
++
++
+ # ===========================================================================
+ #
+ #                                 Conversion
+@@ -2367,6 +2394,44 @@ function to_subnet%(sn: string%): subnet
+ 	return ret;
+ 	%}
+ 
++## Converts a :bro:type:`addr` to a :bro:type:`subnet`.
++##
++## a: The address to convert.
++##
++## Returns: The *a* address as a :bro:type:`subnet`.
++##
++## .. bro:see:: to_subset
++function addr_to_subnet%(a: addr%): subnet
++	%{
++	int width = (a->AsAddr().GetFamily() == IPv4 ? 32 : 128);
++	return new SubNetVal(a->AsAddr(), width);
++	%}
++
++## Converts a :bro:type:`subnet` to a :bro:type:`addr` by
++## extracting the prefix.
++##
++## s: The subnet to convert.
++##
++## Returns: The *s* subnet as a :bro:type:`addr`.
++##
++## .. bro:see:: to_subset
++function subnet_to_addr%(sn: subnet%): addr
++	%{
++	return new AddrVal(sn->Prefix());
++	%}
++
++## Returns the width of a :bro:type:`subnet`.
++##
++## s: The subnet to convert.
++##
++## Returns: The width of the subnet.
++##
++## .. bro:see:: to_subset
++function subnet_width%(sn: subnet%): count
++	%{
++	return new Val(sn->Width(), TYPE_COUNT);
++	%}
++
+ ## Converts a :bro:type:`string` to a :bro:type:`double`.
+ ##
+ ## str: The :bro:type:`string` to convert.
+diff --git a/src/parse.y b/src/parse.y
+index c677328..ad275e0 100644
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -2,7 +2,7 @@
+ // See the file "COPYING" in the main distribution directory for copyright.
+ %}
+ 
+-%expect 78
++%expect 81
+ 
+ %token TOK_ADD TOK_ADD_TO TOK_ADDR TOK_ANY
+ %token TOK_ATENDIF TOK_ATELSE TOK_ATIF TOK_ATIFDEF TOK_ATIFNDEF
+@@ -25,7 +25,7 @@
+ %token TOK_ATTR_PERSISTENT TOK_ATTR_SYNCHRONIZED
+ %token TOK_ATTR_RAW_OUTPUT TOK_ATTR_MERGEABLE
+ %token TOK_ATTR_PRIORITY TOK_ATTR_LOG TOK_ATTR_ERROR_HANDLER
+-%token TOK_ATTR_TYPE_COLUMN TOK_ATTR_DEPRECATED
++%token TOK_ATTR_TYPE_COLUMN TOK_ATTR_DEPRECATED TOK_ATTR_WEAKEN
+ 
+ %token TOK_DEBUG
+ 
+@@ -1285,6 +1285,8 @@ attr:
+ 			{ $$ = new Attr(ATTR_ERROR_HANDLER); }
+ 	|	TOK_ATTR_DEPRECATED
+ 			{ $$ = new Attr(ATTR_DEPRECATED); }
++	|	TOK_ATTR_WEAKEN
++			{ $$ = new Attr(ATTR_WEAKEN); }
+ 	;
+ 
+ stmt:
+diff --git a/src/scan.l b/src/scan.l
+index a6e37a6..8103201 100644
+--- a/src/scan.l
++++ b/src/scan.l
+@@ -276,6 +276,7 @@ when	return TOK_WHEN;
+ &type_column	return TOK_ATTR_TYPE_COLUMN;
+ &read_expire	return TOK_ATTR_EXPIRE_READ;
+ &redef		return TOK_ATTR_REDEF;
++&weaken	return TOK_ATTR_WEAKEN;
+ &write_expire	return TOK_ATTR_EXPIRE_WRITE;
+ 
+ &encrypt {
